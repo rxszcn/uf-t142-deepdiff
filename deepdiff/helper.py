@@ -95,6 +95,11 @@ numpy_complex_numbers: Tuple[Type[Any], ...] = (
     np_complexfloating, np_complex64, np_complex128, np_cdouble,
 )
 
+# All numpy integer scalars (signed and unsigned). np.integer is the abstract
+# base of every fixed-width numpy int type, so one membership check covers them.
+# Used to draw the bool/integer boundary that DeepHash keeps distinct.
+numpy_integer_types: Tuple[Type[Any], ...] = (np.integer,) if np is not None else ()  # type: ignore
+
 numpy_dtypes: Set[Type[Any]] = set(numpy_numbers)
 numpy_dtypes.add(np_bool_)  # type: ignore
 numpy_dtypes.add(np_datetime64)  # type: ignore

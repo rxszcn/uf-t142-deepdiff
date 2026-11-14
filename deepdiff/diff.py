@@ -19,7 +19,7 @@ from collections import defaultdict
 from inspect import getmembers
 from itertools import zip_longest
 from functools import lru_cache
-from deepdiff.helper import (strings, bytes_type, numbers, uuids, ListItemRemovedOrAdded, notpresent, not_found,
+from deepdiff.helper import (strings, bytes_type, numbers, numpy_integer_types, uuids, ListItemRemovedOrAdded, notpresent, not_found,
                              IndexedHash, unprocessed, add_to_frozen_set, basic_types,
                              convert_item_or_items_into_set_else_none, get_type,
                              convert_item_or_items_into_compiled_regexes_else_none,
@@ -827,8 +827,51 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         hashes_added = t2_hashes - t1_hashes
         hashes_removed = t1_hashes - t2_hashes
 
-        items_added = [t2_hashtable[i].item for i in hashes_added]
-        items_removed = [t1_hashtable[i].item for i in hashes_removed]
+        added_items = [t2_hashtable[i].item for i in hashes_added]
+        removed_items = [t1_hashtable[i].item for i in hashes_removed]
+
+        # DeepHash distinguishes bool from int (bools become BoolObj before the
+        # numeric path), so an equal-valued bool/int pair lands in both the added
+        # and removed buckets and would otherwise be reported as a phantom
+        # add + remove. Pair those items up one-to-one and let the regular
+        # dispatch classify them as type_changes (or as no-diff when numeric type
+        # changes are ignored), mirroring every other container. Genuine
+        # differences stay on the add/remove path below.
+        paired_added_indexes: Set[int] = set()
+        paired_removed_indexes: Set[int] = set()
+        for removed_index, removed_item in enumerate(removed_items):
+            for added_index, added_item in enumerate(added_items):
+                if added_index in paired_added_indexes:
+                    continue
+                if self._is_bool_int_mismatch(removed_item, added_item) \
+                        and removed_item == added_item:
+                    paired_added_indexes.add(added_index)
+                    paired_removed_indexes.add(removed_index)
+                    # Set elements have no index; the value itself is the
+                    # addressable key, matching the existing root[value]
+                    # convention of set_item_added/set_item_removed reports.
+                    change_level = level.branch_deeper(
+                        removed_item,
+                        added_item,
+                        child_relationship_class=SubscriptableIterableRelationship,
+                        child_relationship_param=removed_item,
+                        child_relationship_param2=added_item,
+                    )
+                    self._diff(
+                        change_level,
+                        parents_ids=frozenset({id(removed_item)}),
+                        local_tree=local_tree,
+                    )
+                    break
+
+        items_added = [
+            item for index, item in enumerate(added_items)
+            if index not in paired_added_indexes
+        ]
+        items_removed = [
+            item for index, item in enumerate(removed_items)
+            if index not in paired_removed_indexes
+        ]
 
         for item in items_added:
             if self._count_diff() is StopIteration:
@@ -1099,6 +1142,24 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         # in those cases we have a "iterable_item_moved" operation.
         for tag, t1_from_index, t1_to_index, t2_from_index, t2_to_index in opcodes:
             if tag == 'equal':
+                # difflib judges equality with Python's value semantics, where
+                # True == 1 (and False == 0) with equal hashes. That would make
+                # a bool/int scalar difference silent. Re-dispatch any such pair
+                # through the normal type-aware comparison so it is classified
+                # consistently with dict and ignore-order comparisons.
+                for offset in range(t1_to_index - t1_from_index):
+                    x = level.t1[t1_from_index + offset]
+                    y = level.t2[t2_from_index + offset]
+                    if not self._is_bool_int_mismatch(x, y):
+                        continue
+                    change_level = level.branch_deeper(
+                        x,
+                        y,
+                        child_relationship_class=child_relationship_class,
+                        child_relationship_param=t1_from_index + offset,
+                        child_relationship_param2=t2_from_index + offset,
+                    )
+                    self._diff(change_level, parents_ids, local_tree=local_tree)
                 opcodes_with_values.append(Opcode(
                     tag, t1_from_index, t1_to_index, t2_from_index, t2_to_index,
                 ))
@@ -1912,6 +1973,49 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
         if pending_subtree_jobs:
             self._dispatch_subtree_jobs(pending_subtree_jobs, _original_type, local_tree)
 
+    @staticmethod
+    def _is_bool_int_mismatch(x: Any, y: Any) -> bool:
+        """
+        Whether ``x`` and ``y`` are a boolean/integer pair whose types differ.
+
+        Python treats ``bool`` as a subclass of ``int`` and makes ``True == 1``
+        and ``False == 0`` (with equal hashes), so value-based comparisons
+        collapse the two types. DeepHash, however, keeps them distinct (bools
+        are pre-mixed into ``BoolObj`` before number handling), which lets the
+        ordered/difflib and set paths silently disagree with the recursive
+        dispatch. This predicate is the single, shared definition of that
+        boundary so every container classifies it the same way.
+
+        Scope is deliberately limited to the boolean/integer boundary named in
+        the bug: the boolean side is Python ``bool`` or numpy ``np.bool_`` (via
+        the ``booleans`` tuple), the integer side is Python ``int`` or a numpy
+        integer scalar. Floats such as ``True`` vs ``1.0`` are intentionally
+        excluded so numeric/string behavior outside this boundary is untouched.
+        """
+        x_is_bool = isinstance(x, booleans)
+        y_is_bool = isinstance(y, booleans)
+        if x_is_bool == y_is_bool:
+            # Both bools (or neither): not a bool/integer boundary case.
+            return False
+        # Exactly one side is boolean; inspect the other side's type.
+        candidate = y if x_is_bool else x
+        return isinstance(candidate, int) or isinstance(candidate, numpy_integer_types)
+
+    def _bool_int_type_change_ignored(self, level: Any) -> bool:
+        """
+        Whether a boolean/non-boolean integer mismatch at ``level`` must be
+        treated as equal because numeric type changes are being ignored.
+
+        DeepHash always keeps bool and int apart (it never routes bools
+        through the numeric code path), so ``ignore_numeric_type_changes``
+        alone cannot silence hash-based paths. This guard restores the
+        documented intent: when numeric type changes are ignored and the
+        underlying values are equal, the pair is not a difference at all.
+        """
+        if not self.ignore_numeric_type_changes:
+            return False
+        return self._is_bool_int_mismatch(level.t1, level.t2) and level.t1 == level.t2
+
     def _diff_booleans(self, level, local_tree=None):
         if level.t1 != level.t2:
             self._report_result('values_changed', level, local_tree=local_tree)
@@ -2119,6 +2223,13 @@ class DeepDiff(ResultDict, SerializationMixin, DistanceMixin, DeepDiffProtocol, 
             return
 
         if self._skip_this(level):
+            return
+
+        # DeepHash keeps bool and int distinct regardless of
+        # ignore_numeric_type_changes, so hash-based paths can reach here with
+        # an equal-valued bool/int pair. Honor the flag before any type-change
+        # classification: equal values with ignored numeric types are not a diff.
+        if self._bool_int_type_change_ignored(level):
             return
 
         report_type_change = True
